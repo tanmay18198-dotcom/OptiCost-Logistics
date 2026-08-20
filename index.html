@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GeM Order Logistics Calculator</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #eef2f5;
+            margin: 0;
+            padding: 30px;
+        }
+        .card {
+            max-width: 650px;
+            background: #ffffff;
+            margin: auto;
+            padding: 25px;
+            border-radius: 10px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        }
+        h2 {
+            color: #1a365d;
+            border-bottom: 2px solid #e2e8f0;
+            padding-bottom: 10px;
+            margin-top: 0;
+        }
+        .upload-section {
+            border: 2px dashed #cbd5e0;
+            padding: 25px;
+            text-align: center;
+            border-radius: 8px;
+            background: #f8fafc;
+        }
+        input[type="file"] { display: none; }
+        .file-btn {
+            background: #3182ce;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            display: inline-block;
+            font-weight: bold;
+        }
+        .file-btn:hover { background: #2b6cb0; }
+        .loader {
+            display: none;
+            color: #3182ce;
+            font-weight: bold;
+            margin-top: 15px;
+        }
+        .results-section { display: none; }
+        .loc-box {
+            background: #f8fafc;
+            border-left: 4px solid #3182ce;
+            padding: 12px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .loc-box strong { color: #2d3748; }
+        .route-info {
+            display: flex;
+            justify-content: space-between;
+            background: #ebf8ff;
+            padding: 15px;
+            border-radius: 6px;
+            margin: 20px 0;
+            font-weight: bold;
+            color: #2b6cb0;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        th { background: #f7fafc; color: #4a5568; }
+        tr:hover { background: #f8fafc; }
+        .error-box {
+            color: #c53030;
+            background: #fff5f5;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 15px;
+            display: none;
+        }
+        .btn-reset {
+            margin-top: 20px;
+            background: #718096;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            border: none;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>GeM Logistics Calculator</h2>
+
+    <!-- Upload Card -->
+    <div id="uploadSection" class="upload-section">
+        <p>Upload a GeM Order PDF file to calculate live traffic route distance and delivery charges.</p>
+        <label for="pdfFile" class="file-btn">Choose PDF File</label>
+        <input type="file" id="pdfFile" accept="application/pdf">
+        <div id="loader" class="loader">Processing PDF & Calculating Distance...</div>
+    </div>
+
+    <!-- Error Box -->
+    <div id="errorBox" class="error-box"></div>
+
+    <!-- Results Card -->
+    <div id="resultsSection" class="results-section">
+        <div class="loc-box">
+            <strong>Seller Location (Pickup):</strong><br>
+            <span id="sellerLoc">-</span>
+        </div>
+        <div class="loc-box">
+            <strong>Buyer Location (Dropoff):</strong><br>
+            <span id="buyerLoc">-</span>
+        </div>
+
+        <div class="route-info">
+            <span id="distVal">Distance: -</span>
+            <span id="timeVal">Est. Time: -</span>
+        </div>
+
+        <h3>Estimated Vehicle Costs</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Vehicle Type</th>
+                    <th>Base Rate</th>
+                    <th>Per KM</th>
+                    <th>Total Cost</th>
+                </tr>
+            </thead>
+            <tbody id="vehicleTable"></tbody>
+        </table>
+
+        <button class="btn-reset" onclick="resetForm()">Upload Another File</button>
+    </div>
+</div>
+
+<script>
+    const pdfFileInput = document.getElementById('pdfFile');
+    const uploadSection = document.getElementById('uploadSection');
+    const resultsSection = document.getElementById('resultsSection');
+    const loader = document.getElementById('loader');
+    const errorBox = document.getElementById('errorBox');
+
+    pdfFileInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        showLoader(true);
+        hideError();
+
+        const formData = new FormData();
+        formData.append('pdf_file', file);
+
+        try {
+            const response = await fetch('http://localhost:3000/api/process-pdf', {
+                method: 'POST',
+                body: formData
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(data.error || 'Failed to process PDF.');
+            }
+
+            renderResults(data);
+
+        } catch (err) {
+            showError(err.message);
+        } finally {
+            showLoader(false);
+        }
+    });
+
+    function renderResults(data) {
+        document.getElementById('sellerLoc').innerText = data.sellerAddress;
+        document.getElementById('buyerLoc').innerText = data.buyerAddress;
+        document.getElementById('distVal').innerText = `Distance: ${data.distanceKm} km`;
+        document.getElementById('timeVal').innerText = `Est. Time: ${data.duration}`;
+
+        const tbody = document.getElementById('vehicleTable');
+        tbody.innerHTML = '';
+
+        data.vehicles.forEach(item => {
+            tbody.innerHTML += `
+                <tr>
+                    <td><strong>${item.type}</strong></td>
+                    <td>₹${item.base}</td>
+                    <td>₹${item.perKm}/km</td>
+                    <td><strong>₹${item.totalCost.toLocaleString('en-IN', {minimumFractionDigits: 2})}</strong></td>
+                </tr>
+            `;
+        });
+
+        uploadSection.style.display = 'none';
+        resultsSection.style.display = 'block';
+    }
+
+    function showLoader(flag) {
+        loader.style.display = flag ? 'block' : 'none';
+    }
+
+    function showError(msg) {
+        errorBox.innerText = msg;
+        errorBox.style.display = 'block';
+    }
+
+    function hideError() {
+        errorBox.style.display = 'none';
+    }
+
+    function resetForm() {
+        pdfFileInput.value = '';
+        resultsSection.style.display = 'none';
+        uploadSection.style.display = 'block';
+        hideError();
+    }
+</script>
+</body>
+</html>
