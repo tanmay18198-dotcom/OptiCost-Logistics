@@ -3,7 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GeM Order Logistics Calculator</title>
+    <title>GeM Logistics Calculator</title>
+
+    <!-- PDF.js CDN for Client-Side PDF Parsing -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    </script>
+
     <style>
         * { box-sizing: border-box; }
         body {
@@ -106,18 +113,18 @@
 <div class="card">
     <h2>GeM Logistics Calculator</h2>
 
-    <!-- Upload Card -->
+    <!-- Upload Box -->
     <div id="uploadSection" class="upload-section">
         <p>Upload a GeM Order PDF file to calculate live traffic route distance and delivery charges.</p>
         <label for="pdfFile" class="file-btn">Choose PDF File</label>
         <input type="file" id="pdfFile" accept="application/pdf">
-        <div id="loader" class="loader">Processing PDF & Calculating Distance...</div>
+        <div id="loader" class="loader">Parsing PDF & Calculating Distance...</div>
     </div>
 
-    <!-- Error Box -->
+    <!-- Error Display -->
     <div id="errorBox" class="error-box"></div>
 
-    <!-- Results Card -->
+    <!-- Results Display -->
     <div id="resultsSection" class="results-section">
         <div class="loc-box">
             <strong>Seller Location (Pickup):</strong><br>
@@ -157,6 +164,14 @@
     const loader = document.getElementById('loader');
     const errorBox = document.getElementById('errorBox');
 
+    const vehicleRates = [
+        { name: 'Bike', base: 40, perKm: 8 },
+        { name: 'Car', base: 100, perKm: 14 },
+        { name: 'Mini Tempo', base: 300, perKm: 22 },
+        { name: 'Bolero Pickup', base: 500, perKm: 30 },
+        { name: 'Eicher Truck', base: 1200, perKm: 55 }
+    ];
+
     pdfFileInput.addEventListener('change', async (e) => {
         const file = e.target.files[0];
         if (!file) return;
@@ -164,22 +179,58 @@
         showLoader(true);
         hideError();
 
-        const formData = new FormData();
-        formData.append('pdf_file', file);
-
         try {
-            const response = await fetch('http://localhost:3000/api/process-pdf', {
-                method: 'POST',
-                body: formData
-            });
+            // 1. Extract raw text from PDF client-side
+            const text = await extractTextFromPDF(file);
 
-            const data = await response.json();
+            // 2. Extract Addresses & PIN codes
+            const sellerRegex = /(?:Seller Details|विक्रेता विवरण)([\s\S]*?)(?:Buyer Details|खरीदार विवरण|Product Details|उत्पाद विवरण)/i;
+            const buyerRegex = /(?:Buyer Details|खरीदार विवरण)([\s\S]*?)(?:Paying Authority|भुगतान प्राधिकरण|Financial Approval|Product Details|उत्पाद विवरण)/i;
 
-            if (!response.ok) {
-                throw new Error(data.error || 'Failed to process PDF.');
+            const sellerAddress = extractAddress(text, sellerRegex);
+            const buyerAddress = extractAddress(text, buyerRegex);
+
+            if (!sellerAddress || !buyerAddress) {
+                throw new Error('Could not extract valid PIN codes or addresses from this PDF layout.');
             }
 
-            renderResults(data);
+            document.getElementById('sellerLoc').innerText = sellerAddress;
+            document.getElementById('buyerLoc').innerText = buyerAddress;
+
+            // 3. Geocode addresses using OpenStreetMap (Nominatim)
+            let sellerCoords = await geocodeAddress(sellerAddress);
+            if (!sellerCoords) {
+                sellerCoords = await geocodeAddress(extractPinCode(sellerAddress));
+            }
+
+            let buyerCoords = await geocodeAddress(buyerAddress);
+            if (!buyerCoords) {
+                buyerCoords = await geocodeAddress(extractPinCode(buyerAddress));
+            }
+
+            if (!sellerCoords || !buyerCoords) {
+                throw new Error('Could not geocode one of the locations. Please check the addresses in the PDF.');
+            }
+
+            // 4. Calculate driving route using OSRM
+            const route = await getOsrmRoute(sellerCoords, buyerCoords);
+            if (!route) {
+                throw new Error('Could not calculate driving distance between these locations.');
+            }
+
+            const distanceKm = Number((route.distanceMeters / 1000).toFixed(2));
+            const durationMins = Math.round(route.durationSeconds / 60);
+            const durationText = durationMins > 60
+                ? `${Math.floor(durationMins / 60)} hr ${durationMins % 60} mins`
+                : `${durationMins} mins`;
+
+            document.getElementById('distVal').innerText = `Distance: ${distanceKm} km`;
+            document.getElementById('timeVal').innerText = `Est. Time: ${durationText}`;
+
+            renderRates(distanceKm);
+
+            uploadSection.style.display = 'none';
+            resultsSection.style.display = 'block';
 
         } catch (err) {
             showError(err.message);
@@ -188,28 +239,95 @@
         }
     });
 
-    function renderResults(data) {
-        document.getElementById('sellerLoc').innerText = data.sellerAddress;
-        document.getElementById('buyerLoc').innerText = data.buyerAddress;
-        document.getElementById('distVal').innerText = `Distance: ${data.distanceKm} km`;
-        document.getElementById('timeVal').innerText = `Est. Time: ${data.duration}`;
+    async function extractTextFromPDF(file) {
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        let fullText = '';
 
+        for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+            const page = await pdf.getPage(pageNum);
+            const textContent = await page.getTextContent();
+            const pageText = textContent.items.map(item => item.str).join(' ');
+            fullText += ' ' + pageText;
+        }
+
+        return fullText;
+    }
+
+    function extractAddress(text, sectionHeaderRegex) {
+        const sectionMatch = text.match(sectionHeaderRegex);
+        if (!sectionMatch) return null;
+
+        const sectionText = sectionMatch[1];
+        const fullAddrMatch = sectionText.match(/([A-Za-z0-9\s,.\-\/#():]+\b\d{6},\s*India)/i);
+        if (fullAddrMatch) {
+            return sanitizeAddress(fullAddrMatch[1]);
+        }
+
+        const pinMatch = sectionText.match(/\b(\d{6})\b/);
+        return pinMatch ? `${pinMatch[1]}, India` : null;
+    }
+
+    function extractPinCode(addressStr) {
+        const match = addressStr.match(/\b(\d{6})\b/);
+        return match ? `${match[1]}, India` : addressStr;
+    }
+
+    function sanitizeAddress(str) {
+        return str
+            .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '')
+            .replace(/(?:पता|Address|जीएसटीआईएन|GSTIN|ईमेल आईडी|Email ID|संपर्क नंबर|Contact No|पद|Designation)\s*[:|]?/gi, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    async function geocodeAddress(addressQuery) {
+        try {
+            const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(addressQuery)}&format=json&limit=1`;
+            const response = await fetch(url);
+            const data = await response.json();
+            if (data && data.length > 0) {
+                return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
+            }
+        } catch (e) {
+            console.error('Geocoding error:', e);
+        }
+        return null;
+    }
+
+    async function getOsrmRoute(startCoords, endCoords) {
+        try {
+            const url = `https://router.project-osrm.org/route/v1/driving/${startCoords.lon},${startCoords.lat};${endCoords.lon},${endCoords.lat}?overview=false`;
+            const response = await fetch(url);
+            const data = await response.json();
+
+            if (data.code === 'Ok' && data.routes && data.routes.length > 0) {
+                return {
+                    distanceMeters: data.routes[0].distance,
+                    durationSeconds: data.routes[0].duration
+                };
+            }
+        } catch (e) {
+            console.error('OSRM error:', e);
+        }
+        return null;
+    }
+
+    function renderRates(distanceKm) {
         const tbody = document.getElementById('vehicleTable');
         tbody.innerHTML = '';
 
-        data.vehicles.forEach(item => {
+        vehicleRates.forEach(v => {
+            const total = v.base + (distanceKm * v.perKm);
             tbody.innerHTML += `
                 <tr>
-                    <td><strong>${item.type}</strong></td>
-                    <td>₹${item.base}</td>
-                    <td>₹${item.perKm}/km</td>
-                    <td><strong>₹${item.totalCost.toLocaleString('en-IN', {minimumFractionDigits: 2})}</strong></td>
+                    <td><strong>${v.name}</strong></td>
+                    <td>₹${v.base}</td>
+                    <td>₹${v.perKm}/km</td>
+                    <td><strong>₹${total.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</strong></td>
                 </tr>
             `;
         });
-
-        uploadSection.style.display = 'none';
-        resultsSection.style.display = 'block';
     }
 
     function showLoader(flag) {
